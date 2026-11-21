@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zwift-map-merge"
-version = "0.1.1"
+version = "0.1.2"
 description = "Adds the map of a Zwift activity to the watch activity (full data) directly in Garmin Connect"
 readme = "README.md"
 license = "MIT"

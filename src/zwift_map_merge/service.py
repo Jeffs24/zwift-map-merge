@@ -117,14 +117,41 @@ class Service:
         Activities already looked at are skipped, so running it again only
         fetches new ones. ``progress(counts, message)`` is called after each one.
         """
-        counts = {"seen": 0, "downloaded": 0, "paired": 0, "skipped": 0, "errors": 0}
-        garmin_acts = self.garmin.activities_between(since.date() - timedelta(days=1),
-                                                     datetime.now(timezone.utc).date() + timedelta(days=1))
+        counts = {"listed": 0, "seen": 0, "downloaded": 0, "paired": 0, "skipped": 0, "errors": 0}
+
+        def report(message: str) -> None:
+            log.info("Zwift sync: %s", message)
+            if progress:
+                progress(counts, message)
+
+        # 1. List Zwift first: it is quick and tells which period matters.
+        report("Listing your Zwift activities…")
+        zwift_acts = []
+        for act in zwift.history(since):
+            zwift_acts.append(act)
+            counts["listed"] += 1
+            if counts["listed"] % 30 == 0:
+                report(f"Listing your Zwift activities… {counts['listed']} found")
+        dated = [a.start for a in zwift_acts if a.start]
+        if not dated:
+            report(f"No Zwift activity found since {since:%Y-%m-%d}.")
+            return counts
+
+        # 2. Load Garmin activities only over the period covered by Zwift.
+        first, last = min(dated), max(dated)
+        report(f"{counts['listed']} Zwift activities found ({first:%Y-%m-%d} to {last:%Y-%m-%d}). "
+               "Loading your Garmin activities for that period…")
+        garmin_acts = self.garmin.activities_between(first.date() - timedelta(days=1),
+                                                     last.date() + timedelta(days=1))
         handled = self.store.handled_ids()
         # Only Zwift activities that overlap a watch activity without a map are downloaded.
         watch = [s for s in (parse_summary(a) for a in garmin_acts)
                  if s and not s.has_polyline and s.id not in handled]
-        for act in zwift.history(since):
+        report(f"{len(garmin_acts)} Garmin activities loaded, {len(watch)} without a map. "
+               "Matching and downloading…")
+
+        # 3. Download and pair.
+        for act in zwift_acts:
             counts["seen"] += 1
             if self.store.zwift_seen(act.id):
                 counts["skipped"] += 1
@@ -149,14 +176,14 @@ class Service:
             except Exception as e:  # noqa: BLE001 - keep going, retried next sync
                 log.warning("Zwift activity %s failed: %s", act.id, e)
                 counts["errors"] += 1
-                if progress:
-                    progress(counts, f"{act.name}: {e}")
+                report(f"{act.name}: {e}")
                 continue
             if target_id:
                 counts["paired"] += 1
             self.store.mark_zwift_seen(act.id, act.name, start_iso, target_id, msg)
-            if progress:
-                progress(counts, msg)
+            report(msg)
+        report(f"Done: {counts['listed']} Zwift activities listed, {counts['downloaded']} downloaded, "
+               f"{counts['paired']} paired.")
         return counts
 
     def scan_and_maybe_merge(self) -> None:

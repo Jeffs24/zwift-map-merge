@@ -155,3 +155,26 @@ def test_sync_keeps_pair_found_by_scan(tmp_path):
     svc.sync_zwift(zw, START_UTC - timedelta(days=1))
     assert store.get(1)["source_id"] == 2  # still deletes the Garmin copy on merge
     assert GMT
+
+
+def test_sync_lists_zwift_first_and_loads_garmin_only_for_that_period(tmp_path):
+    svc, g, store = make(tmp_path)
+    ranges = []
+    orig = g.activities_between
+    g.activities_between = lambda s, e: ranges.append((s, e)) or orig(s, e)
+    messages = []
+    zw = FakeZwift([ZwiftActivity("z1", "Zwift", START_UTC, "RUNNING", "b", "k")])
+    svc.sync_zwift(zw, datetime(2010, 1, 1, tzinfo=timezone.utc), lambda c, m: messages.append(m))
+    assert ranges == [(START_UTC.date() - timedelta(days=1), START_UTC.date() + timedelta(days=1))]
+    assert messages[0].startswith("Listing your Zwift activities")
+    assert messages[-1].startswith("Done:")
+
+
+def test_sync_without_zwift_activities_never_calls_garmin(tmp_path):
+    svc, g, store = make(tmp_path)
+    g.activities_between = lambda s, e: pytest.fail("Garmin should not be called")
+    messages = []
+    counts = svc.sync_zwift(FakeZwift([]), datetime(2010, 1, 1, tzinfo=timezone.utc),
+                            lambda c, m: messages.append(m))
+    assert counts["listed"] == 0
+    assert "No Zwift activity found since 2010-01-01" in messages[-1]

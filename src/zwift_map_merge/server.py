@@ -193,7 +193,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "<input name='email' type='email' placeholder='Email' required>"
                 "<input name='password' type='password' placeholder='Password' required>"
                 "<button class='primary'>Log in</button></form></div>")
-        return _page(_dashboard(cfg, store, state, zwift.connected()))
+        busy = state["zwift"]["running"] or any(r["status"] == "running" for r in store.all())
+        return _page(_dashboard(cfg, store, state, zwift.connected()),
+                     head="<meta http-equiv='refresh' content='5'>" if busy else "")
 
     @app.post("/login", dependencies=[Depends(check_auth)])
     def login(email: str = Form(...), password: str = Form(...)) -> RedirectResponse:
@@ -408,12 +410,13 @@ def _zwift_card(cfg: Config, state: dict, connected: bool) -> str:
     if zs["running"]:
         c = zs["counts"] or {}
         status = (f"<p>Syncing since {html.escape(zs['since'] or '')}… "
-                  f"{c.get('seen', 0)} Zwift activities looked at, {c.get('downloaded', 0)} downloaded, "
-                  f"{c.get('paired', 0)} paired. <a href='/'>Refresh</a></p>")
+                  f"{c.get('listed', 0)} Zwift activities listed, {c.get('seen', 0)} checked, "
+                  f"{c.get('downloaded', 0)} downloaded, {c.get('paired', 0)} paired. "
+                  "<span class='msg'>(the page refreshes by itself)</span></p>")
     elif zs["counts"] is not None or zs["error"]:
         c = zs["counts"] or {}
         status = (f"<p class='msg'>Last sync ({html.escape(zs['finished_at'] or '')}, since "
-                  f"{html.escape(zs['since'] or '')}): {c.get('seen', 0)} looked at, "
+                  f"{html.escape(zs['since'] or '')}): {c.get('listed', 0)} listed, "
                   f"{c.get('downloaded', 0)} downloaded, {c.get('paired', 0)} paired, "
                   f"{c.get('errors', 0)} errors.</p>")
         if zs["error"]:
