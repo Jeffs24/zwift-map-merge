@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import secrets
 import threading
@@ -16,6 +17,7 @@ from . import __version__
 from .config import Config
 from .garmin import GarminAuthRequired, GarminSession
 from .service import Service
+from .preview import summarize
 from .store import Store
 from .zwift import ZwiftClient
 
@@ -52,11 +54,11 @@ a { color:var(--accent); }
 """
 
 
-def _page(body: str) -> HTMLResponse:
+def _page(body: str, head: str = "") -> HTMLResponse:
     return HTMLResponse(
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>zwift-map-merge</title><style>{CSS}</style></head><body><main>"
+        f"<title>zwift-map-merge</title><style>{CSS}</style>{head}</head><body><main>"
         "<h1>zwift-map-merge</h1><p class='sub'>Adds the Zwift map to your watch activity "
         f"in Garmin Connect · v{__version__}</p>{body}</main></body></html>"
     )
@@ -265,7 +267,104 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(404)
         return FileResponse(path, filename=f"{target_id}_merged.fit", media_type="application/octet-stream")
 
+    @app.get("/pairs/{target_id}/preview", response_class=HTMLResponse, dependencies=[Depends(check_auth)])
+    def preview(target_id: int) -> HTMLResponse:
+        row = store.get(target_id)
+        if not row:
+            raise HTTPException(404)
+        path = cfg.backup_dir / str(target_id) / f"{target_id}_merged.fit"
+        if not path.exists():
+            return _page("<div class='card'><p>No merged file yet: click <b>Simulate</b> first.</p>"
+                         "<p><a href='/'>← Back</a></p></div>")
+        return _page(*_preview_page(cfg, row, summarize(path.read_bytes())))
+
     return app
+
+
+def _svg_chart(name: str, points: list[tuple[float, float]], invert: bool = False) -> str:
+    """Small line chart as inline SVG (x = minutes)."""
+    w, h, pad = 640, 120, 4
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs) or 1
+    y0, y1 = min(ys), max(ys)
+    if y1 - y0 < 1e-9:
+        y1 = y0 + 1
+    def px(x, y):
+        fx = pad + (x - x0) / ((x1 - x0) or 1) * (w - 2 * pad)
+        fy = (y - y0) / (y1 - y0)
+        fy = fy if invert else 1 - fy
+        return f"{fx:.1f},{pad + fy * (h - 2 * pad):.1f}"
+    line = " ".join(px(x, y) for x, y in points)
+    fmt = (lambda v: f"{int(v)}:{int(v % 1 * 60):02d}") if name.startswith("Pace") else (lambda v: f"{v:.0f}")
+    top, bottom = (y0, y1) if invert else (y1, y0)
+    return (
+        f"<div class='chart'><div class='row' style='justify-content:space-between'><b>{html.escape(name)}</b>"
+        f"<span class='msg'>{fmt(bottom)} – {fmt(top)}</span></div>"
+        f"<svg viewBox='0 0 {w} {h}' preserveAspectRatio='none' role='img' aria-label='{html.escape(name)}'>"
+        f"<polyline points='{line}' fill='none' stroke='var(--accent)' stroke-width='1.5' "
+        "vector-effect='non-scaling-stroke'/></svg>"
+        f"<div class='row msg' style='justify-content:space-between'><span>0 min</span>"
+        f"<span>{x1:.0f} min</span></div></div>"
+    )
+
+
+def _preview_page(cfg: Config, row: dict, pv) -> tuple[str, str]:
+    tid = row["target_id"]
+    merged = row["status"] == "merged"
+    stats = "".join(
+        f"<div class='stat'><span class='msg'>{html.escape(k)}</span><b>{html.escape(v)}</b></div>"
+        for k, v in pv.stats.items())
+    charts = "".join(_svg_chart(name, pts, invert=name.startswith("Pace")) for name, pts in pv.series.items())
+    if merged:
+        what = (f"This activity is on Garmin: <a href='https://connect.garmin.com/modern/activity/"
+                f"{row['new_id']}' target='_blank' rel='noopener'>#{row['new_id']}</a>.")
+    else:
+        deleted = f"watch activity #{tid}"
+        if row["source_id"] and cfg.delete_source:
+            deleted += f" and the Zwift copy #{row['source_id']}"
+        what = (f"Nothing has changed on Garmin yet. <b>Merge</b> will delete the {deleted}, import this file, "
+                f"then restore the name “{html.escape(row['target_name'] or '')}”, description, type and gear.")
+    track_json = json.dumps(pv.track)
+    started = f"{pv.start:%Y-%m-%d %H:%M} UTC" if pv.start else ""
+    body = (
+        "<p><a href='/'>← Back</a></p>"
+        f"<div class='card'><h2 style='margin:0'>{html.escape(row['target_name'] or 'Activity')}</h2>"
+        f"<p class='msg' style='margin:4px 0 0'>{html.escape(pv.sport)} · {started} · "
+        f"map from {html.escape(row['source_name'] or 'Zwift')}</p>"
+        f"<p>{what}</p>"
+        + (f"<div class='row'><form class='inline' method='post' action='/pairs/{tid}/merge' "
+           "onsubmit=\"return confirm('Delete the activities on Garmin and import the merged one?')\">"
+           "<button class='primary'>Merge</button></form>"
+           f"<a href='/pairs/{tid}/merged.fit'>Download merged FIT</a></div>" if not merged else "")
+        + "</div>"
+        "<div class='card'><div id='map'></div>"
+        "<p class='msg'>Zwift worlds are mapped onto real coordinates (Watopia sits in the Solomon Islands), "
+        "so the track is drawn over that real place, as Garmin will show it.</p></div>"
+        f"<div class='card'><div class='stats'>{stats}</div></div>"
+        f"<div class='card'>{charts or '<p class=msg>No data series.</p>'}</div>"
+        "<script>"
+        f"const track = {track_json};"
+        "if (track.length && window.L) {"
+        " const map = L.map('map', {scrollWheelZoom: false});"
+        " L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',"
+        "  {maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'}).addTo(map);"
+        " const line = L.polyline(track, {color: '#fc6719', weight: 4}).addTo(map);"
+        " L.circleMarker(track[0], {radius: 6, color: '#1f8a4c', fillOpacity: 1}).addTo(map);"
+        " L.circleMarker(track[track.length - 1], {radius: 6, color: '#c0392b', fillOpacity: 1}).addTo(map);"
+        " map.fitBounds(line.getBounds(), {padding: [20, 20]});"
+        "} else { document.getElementById('map').innerHTML = '<p class=msg>No GPS track.</p>'; }"
+        "</script>"
+    )
+    head = (
+        "<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css'>"
+        "<script src='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js'></script>"
+        "<style>#map{height:420px;border-radius:8px}.stats{display:grid;"
+        "grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px}.stat{display:flex;flex-direction:column}"
+        ".chart{margin-bottom:16px}.chart svg{width:100%;height:120px;display:block;"
+        "background:var(--bg);border-radius:6px}</style>"
+    )
+    return body, head
 
 
 def _zwift_card(cfg: Config, state: dict, connected: bool) -> str:
@@ -355,7 +454,7 @@ def _dashboard(cfg: Config, store: Store, state: dict, zwift_connected: bool = F
                 f"<form class='inline' method='post' action='/pairs/{tid}/ignore'><button>Ignore</button></form>"
             )
         if status in ("simulated", "merged"):
-            actions += f" <a href='/pairs/{tid}/merged.fit'>Merged FIT</a>"
+            actions += f" <a href='/pairs/{tid}/preview'>Preview</a> · <a href='/pairs/{tid}/merged.fit'>FIT</a>"
         new = (f"<br><a href='https://connect.garmin.com/modern/activity/{r['new_id']}' target='_blank' rel='noopener'>"
                "View on Garmin</a>") if r["new_id"] else ""
         lines.append(

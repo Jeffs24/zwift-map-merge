@@ -33,7 +33,7 @@ Open `http://SERVER:8126` and log in to Garmin (MFA codes are supported). Only t
 ## Usage
 
 - The page lists the detected pairs (scan every 30 min over 7 days, or the “Scan now” button).
-- **Simulate**: downloads and merges without changing anything on Garmin. The merged FIT can be downloaded to check it.
+- **Simulate**: downloads and merges without changing anything on Garmin. Then **Preview** shows the merged activity as Garmin will get it: map, stats (time, distance, heart rate, cadence, power, laps, GPS points) and charts. The merged FIT can also be downloaded.
 - **Merge**: replaces the activities on Garmin.
 - **Ignore**: the pair is no longer offered.
 
