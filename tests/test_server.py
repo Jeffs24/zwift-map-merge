@@ -38,3 +38,52 @@ def test_password_protects_ui(tmp_path):
         assert c.get("/").status_code == 401
         assert c.get("/", auth=("x", "secret")).status_code == 200
         assert c.get("/health").status_code == 200
+
+
+def test_get_on_action_urls_goes_back_to_the_page(tmp_path):
+    with client(tmp_path) as c:
+        for path in ("/login", "/mfa", "/scan", "/zwift/sync"):
+            r = c.get(path, follow_redirects=False)
+            assert r.status_code == 303 and r.headers["location"] == "/"
+        assert c.head("/").status_code == 200
+        assert c.head("/health").status_code == 200
+
+
+def test_login_runs_in_background_then_asks_mfa(tmp_path):
+    import threading
+
+    with client(tmp_path) as c:
+        release = threading.Event()
+
+        def slow_login(email, password):
+            release.wait(5)
+            return True  # Garmin wants an MFA code
+
+        c.app.state.service.garmin.start_login = slow_login
+        r = c.post("/login", data={"email": "a@b.c", "password": "x"}, follow_redirects=False)
+        assert r.status_code == 303
+        assert "Logging in to Garmin" in c.get("/").text
+        release.set()
+        for _ in range(50):
+            page = c.get("/").text
+            if "verification code" in page:
+                break
+            threading.Event().wait(0.05)
+        assert "Garmin verification code" in page
+
+
+def test_login_error_is_shown(tmp_path):
+    import threading
+
+    with client(tmp_path) as c:
+        def bad_login(email, password):
+            raise RuntimeError("401 Unauthorized")
+
+        c.app.state.service.garmin.start_login = bad_login
+        c.post("/login", data={"email": "a@b.c", "password": "x"})
+        for _ in range(50):
+            page = c.get("/").text
+            if "Login refused" in page:
+                break
+            threading.Event().wait(0.05)
+        assert "Login refused: 401 Unauthorized" in page

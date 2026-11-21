@@ -75,7 +75,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.state.zwift = zwift
     zwift_lock = threading.Lock()
     security = HTTPBasic(auto_error=False)
-    state = {"mfa_pending": False, "last_error": None, "upload_results": [],
+    state = {"mfa_pending": False, "login_running": False, "last_error": None, "upload_results": [],
              "zwift": {"running": False, "counts": None, "last": None, "error": None,
                        "login_error": None, "since": None, "finished_at": None}}
 
@@ -148,19 +148,43 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     app.router.lifespan_context = lifespan
 
-    @app.get("/health")
+    @app.api_route("/health", methods=["GET", "HEAD"])
     def health() -> dict:
         return {"ok": True, "garmin": garmin.has_tokens()}
 
-    @app.get("/", response_class=HTMLResponse, dependencies=[Depends(check_auth)])
+    # The action URLs only accept POST. A reload or a bookmark sends a GET:
+    # go back to the page instead of answering "Method Not Allowed".
+    for path in ("/login", "/mfa", "/logout", "/scan", "/upload",
+                 "/zwift/login", "/zwift/logout", "/zwift/sync"):
+        app.add_api_route(path, lambda: RedirectResponse("/", status_code=303),
+                          methods=["GET"], include_in_schema=False)
+
+    def login_job(email: str, password: str) -> None:
+        try:
+            state["mfa_pending"] = garmin.start_login(email, password)
+            state["last_error"] = None
+        except Exception as e:  # noqa: BLE001
+            log.warning("Garmin login failed: %s", e)
+            state["last_error"] = f"Login refused: {e}"
+        finally:
+            state["login_running"] = False
+
+    @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse,
+                   dependencies=[Depends(check_auth)])
     def index() -> HTMLResponse:
+        err = f"<p class='st-failed'>{html.escape(state['last_error'])}</p>" if state["last_error"] else ""
+        if state["login_running"]:
+            return _page(
+                "<div class='card'><h2>Logging in to Garmin…</h2>"
+                "<p class='msg'>This can take up to a minute. The page refreshes by itself.</p></div>",
+                head="<meta http-equiv='refresh' content='3'>")
         if state["mfa_pending"]:
             return _page(
                 "<div class='card'><h2>Garmin verification code</h2>"
+                "<p class='msg'>Enter the code Garmin sent you.</p>" + err +
                 "<form method='post' action='/mfa' class='row'><input name='code' autocomplete='one-time-code' required>"
                 "<button class='primary'>Submit</button></form></div>")
         if not garmin.has_tokens():
-            err = f"<p class='st-failed'>{html.escape(state['last_error'])}</p>" if state["last_error"] else ""
             return _page(
                 "<div class='card'><h2>Garmin Connect login</h2>"
                 "<p class='msg'>Your password is not stored: only the tokens are kept in "
@@ -173,11 +197,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.post("/login", dependencies=[Depends(check_auth)])
     def login(email: str = Form(...), password: str = Form(...)) -> RedirectResponse:
-        try:
-            state["mfa_pending"] = garmin.start_login(email, password)
+        # Garmin's login can take a while (several strategies, retries):
+        # run it in the background so the browser does not wait on this request.
+        if not state["login_running"]:
+            state["login_running"] = True
             state["last_error"] = None
-        except Exception as e:  # noqa: BLE001
-            state["last_error"] = f"Login refused: {e}"
+            threading.Thread(target=login_job, args=(email, password), daemon=True).start()
         return RedirectResponse("/", status_code=303)
 
     @app.post("/mfa", dependencies=[Depends(check_auth)])
