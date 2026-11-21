@@ -6,6 +6,7 @@ import logging
 import secrets
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -16,6 +17,7 @@ from .config import Config
 from .garmin import GarminAuthRequired, GarminSession
 from .service import Service
 from .store import Store
+from .zwift import ZwiftClient
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ th { color:var(--muted); font-weight:500; font-size:13px; }
 form.inline { display:inline; } button { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--line);
   background:var(--card); color:var(--fg); cursor:pointer; } button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
 input { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+a { color:var(--accent); }
 .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; } .wrap { overflow-x:auto; }
 """
 
@@ -66,8 +69,13 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     service = Service(cfg, garmin, store)
     app = FastAPI(title="zwift-map-merge")
     app.state.service = service
+    zwift = ZwiftClient(cfg.zwift_token_file)
+    app.state.zwift = zwift
+    zwift_lock = threading.Lock()
     security = HTTPBasic(auto_error=False)
-    state = {"mfa_pending": False, "last_error": None, "upload_results": []}
+    state = {"mfa_pending": False, "last_error": None, "upload_results": [],
+             "zwift": {"running": False, "counts": None, "last": None, "error": None,
+                       "login_error": None, "since": None, "finished_at": None}}
 
     def check_auth(creds: HTTPBasicCredentials | None = Depends(security)) -> None:
         if not cfg.app_password:
@@ -85,6 +93,25 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 log.exception("Action on %s failed", target_id)
         threading.Thread(target=job, daemon=True).start()
 
+    def zwift_sync(since: datetime) -> None:
+        """Run a Zwift history sync; only one at a time."""
+        zs = state["zwift"]
+        if not zwift_lock.acquire(blocking=False):
+            return
+        zs.update(running=True, error=None, since=since.date().isoformat(), counts=None, last=None)
+
+        def progress(counts, message):
+            zs.update(counts=dict(counts), last=message)
+        try:
+            zs["counts"] = service.sync_zwift(zwift, since, progress)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Zwift sync failed")
+            zs["error"] = str(e)
+        finally:
+            zs["running"] = False
+            zs["finished_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            zwift_lock.release()
+
     def scheduler(stop: threading.Event) -> None:
         if not garmin.has_tokens() and cfg.garmin_email and cfg.garmin_password:
             try:
@@ -92,10 +119,18 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     state["mfa_pending"] = True
             except Exception as e:  # noqa: BLE001
                 log.warning("Automatic Garmin login failed: %s", e)
+        if not zwift.connected() and cfg.zwift_email and cfg.zwift_password:
+            try:
+                zwift.login(cfg.zwift_email, cfg.zwift_password)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Automatic Zwift login failed: %s", e)
         while not stop.is_set():
             if garmin.has_tokens():
                 try:
-                    service.scan_and_maybe_merge()
+                    service.scan()
+                    if zwift.connected() and cfg.zwift_auto_sync:
+                        zwift_sync(datetime.now(timezone.utc) - timedelta(days=cfg.scan_days))
+                    service.merge_pending()
                     state["last_error"] = None
                 except Exception as e:  # noqa: BLE001
                     log.exception("Scan failed")
@@ -132,7 +167,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "<input name='email' type='email' placeholder='Email' required>"
                 "<input name='password' type='password' placeholder='Password' required>"
                 "<button class='primary'>Log in</button></form></div>")
-        return _page(_dashboard(cfg, store, state))
+        return _page(_dashboard(cfg, store, state, zwift.connected()))
 
     @app.post("/login", dependencies=[Depends(check_auth)])
     def login(email: str = Form(...), password: str = Form(...)) -> RedirectResponse:
@@ -185,6 +220,30 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         state["upload_results"] = results
         return RedirectResponse("/", status_code=303)
 
+    @app.post("/zwift/login", dependencies=[Depends(check_auth)])
+    def zwift_login(email: str = Form(...), password: str = Form(...)) -> RedirectResponse:
+        try:
+            zwift.login(email, password)
+            state["zwift"]["login_error"] = None
+        except Exception as e:  # noqa: BLE001
+            state["zwift"]["login_error"] = f"Zwift login refused: {e}"
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/zwift/logout", dependencies=[Depends(check_auth)])
+    def zwift_logout() -> RedirectResponse:
+        zwift.logout()
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/zwift/sync", dependencies=[Depends(check_auth)])
+    def zwift_sync_route(since: str = Form(...)) -> RedirectResponse:
+        try:
+            start = datetime.fromisoformat(since).replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(400, "invalid date")
+        if zwift.connected() and garmin.has_tokens():
+            threading.Thread(target=zwift_sync, args=(start,), daemon=True).start()
+        return RedirectResponse("/", status_code=303)
+
     @app.post("/pairs/{target_id}/{action}", dependencies=[Depends(check_auth)])
     def act(target_id: int, action: str) -> RedirectResponse:
         if not store.get(target_id):
@@ -209,7 +268,50 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     return app
 
 
-def _dashboard(cfg: Config, store: Store, state: dict) -> str:
+def _zwift_card(cfg: Config, state: dict, connected: bool) -> str:
+    zs = state["zwift"]
+    err = f"<p class='st-failed'>{html.escape(zs['login_error'])}</p>" if zs["login_error"] else ""
+    if not connected:
+        return (
+            "<div class='card'><b>Zwift account</b>"
+            "<p class='msg'>Connect Zwift to fetch your Zwift FIT files automatically, including your "
+            "whole history. This uses Zwift's unofficial Companion API. Your password is not stored, "
+            "only the tokens.</p>" + err +
+            "<form method='post' action='/zwift/login' class='row'>"
+            "<input name='email' type='email' placeholder='Zwift email' required>"
+            "<input name='password' type='password' placeholder='Zwift password' required>"
+            "<button class='primary'>Connect Zwift</button></form></div>")
+    if zs["running"]:
+        c = zs["counts"] or {}
+        status = (f"<p>Syncing since {html.escape(zs['since'] or '')}… "
+                  f"{c.get('seen', 0)} Zwift activities looked at, {c.get('downloaded', 0)} downloaded, "
+                  f"{c.get('paired', 0)} paired. <a href='/'>Refresh</a></p>")
+    elif zs["counts"] is not None or zs["error"]:
+        c = zs["counts"] or {}
+        status = (f"<p class='msg'>Last sync ({html.escape(zs['finished_at'] or '')}, since "
+                  f"{html.escape(zs['since'] or '')}): {c.get('seen', 0)} looked at, "
+                  f"{c.get('downloaded', 0)} downloaded, {c.get('paired', 0)} paired, "
+                  f"{c.get('errors', 0)} errors.</p>")
+        if zs["error"]:
+            status += f"<p class='st-failed'>{html.escape(zs['error'])}</p>"
+    else:
+        status = ""
+    last = f"<p class='msg'>{html.escape(zs['last'])}</p>" if zs["last"] else ""
+    auto = (f"New Zwift activities are fetched at each scan ({cfg.scan_days} days)."
+            if cfg.zwift_auto_sync else "Automatic fetch is off (ZWIFT_AUTO_SYNC=false).")
+    return (
+        "<div class='card'><div class='row' style='justify-content:space-between'><b>Zwift account: connected</b>"
+        "<form class='inline' method='post' action='/zwift/logout'><button>Disconnect Zwift</button></form></div>"
+        f"<p class='msg'>{auto} To catch up on older activities, sync the history from a date. Only Zwift "
+        "activities that overlap a watch activity without a map are downloaded; the others are skipped. "
+        "Pairs found show up below: nothing changes on Garmin until you merge them.</p>"
+        "<form method='post' action='/zwift/sync' class='row'>"
+        "<label>Since <input type='date' name='since' required value='2020-01-01'></label>"
+        f"<button class='primary' {'disabled' if zs['running'] else ''}>Sync history</button></form>"
+        + status + last + "</div>")
+
+
+def _dashboard(cfg: Config, store: Store, state: dict, zwift_connected: bool = False) -> str:
     rows = store.all()
     mode = ("<b>automatic</b>: every detected pair is merged" if cfg.auto_merge
             else "<b>manual</b>: nothing changes until you click “Merge”")
@@ -221,6 +323,7 @@ def _dashboard(cfg: Config, store: Store, state: dict) -> str:
         "<form class='inline' method='post' action='/logout'><button>Disconnect Garmin</button></form></div>"
         f"</div>{err}</div>"
     )
+    head += _zwift_card(cfg, state, zwift_connected)
     results = state.pop("upload_results", None) or []
     state["upload_results"] = []
     res_html = "".join(f"<li>{html.escape(r)}</li>" for r in results)

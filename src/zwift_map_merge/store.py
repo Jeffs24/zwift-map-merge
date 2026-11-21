@@ -22,6 +22,14 @@ CREATE TABLE IF NOT EXISTS pairs (
     source_file  TEXT,                  -- uploaded Zwift FIT (source_id = 0)
     updated_at   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS zwift_seen (
+    zwift_id     TEXT PRIMARY KEY,
+    name         TEXT,
+    start_utc    TEXT,
+    target_id    INTEGER,              -- watch activity it was paired with, if any
+    result       TEXT,
+    updated_at   TEXT NOT NULL
+);
 """
 
 
@@ -79,6 +87,22 @@ class Store:
         with self._lock:
             rows = self._db.execute("SELECT * FROM pairs ORDER BY start_utc DESC").fetchall()
         return [dict(r) for r in rows]
+
+    def zwift_seen(self, zwift_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM zwift_seen WHERE zwift_id=?", (zwift_id,)).fetchone()
+        return dict(row) if row else None
+
+    def mark_zwift_seen(self, zwift_id: str, name: str, start_utc: str | None,
+                        target_id: int | None, result: str) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                """INSERT INTO zwift_seen (zwift_id, name, start_utc, target_id, result, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(zwift_id) DO UPDATE SET target_id=excluded.target_id,
+                     result=excluded.result, updated_at=excluded.updated_at""",
+                (zwift_id, name, start_utc, target_id, result, _now()),
+            )
 
     def handled_ids(self) -> set[int]:
         """Activity ids that must not be paired again (merged, ignored, or produced by us)."""

@@ -30,6 +30,7 @@ def test_dashboard_lists_pairs(tmp_path):
         assert "Zwift - Watopia" in r.text
         assert "Treadmill &lt;b&gt;" in r.text  # escaped
         assert "/pairs/1/merge" in r.text
+        assert "Connect Zwift" in r.text
 
 
 def test_password_protects_ui(tmp_path):

@@ -29,10 +29,17 @@ class Config:
     app_password: str | None
     garmin_email: str | None
     garmin_password: str | None
+    zwift_email: str | None = None
+    zwift_password: str | None = None
+    zwift_auto_sync: bool = True
 
     @property
     def token_dir(self) -> Path:
         return self.data_dir / "garminconnect"
+
+    @property
+    def zwift_token_file(self) -> Path:
+        return self.data_dir / "zwift_tokens.json"
 
     @property
     def backup_dir(self) -> Path:
@@ -60,4 +67,7 @@ class Config:
             app_password=os.getenv("APP_PASSWORD") or None,
             garmin_email=os.getenv("GARMIN_EMAIL") or None,
             garmin_password=os.getenv("GARMIN_PASSWORD") or None,
+            zwift_email=os.getenv("ZWIFT_EMAIL") or None,
+            zwift_password=os.getenv("ZWIFT_PASSWORD") or None,
+            zwift_auto_sync=_bool("ZWIFT_AUTO_SYNC", True),
         )

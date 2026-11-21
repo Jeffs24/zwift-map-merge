@@ -53,26 +53,40 @@ class Service:
 
         Returns a short message for the UI.
         """
+        return self._pair_source(filename, data, label=f"File {filename}")[1]
+
+    def _pair_source(self, filename: str, data: bytes, *, label: str,
+                     garmin_activities: list[dict] | None = None,
+                     keep_existing: bool = False) -> tuple[int | None, str]:
+        """Pair a Zwift FIT with the overlapping watch activity without a map.
+
+        Returns (watch activity id or None, message). ``garmin_activities``
+        avoids one Garmin request per file during a history sync.
+        ``keep_existing`` leaves a pair found by the scan untouched (it can
+        still delete the Zwift copy on Garmin).
+        """
         if data[:2] == b"\x1f\x8b":
             data = gzip.decompress(data)
         try:
             fit = ff.parse(data)
         except ff.FitError as e:
-            return f"{filename}: unreadable FIT file ({e})"
+            return None, f"{filename}: unreadable FIT file ({e})"
         man = manufacturer(fit)
         if man not in self.cfg.source_manufacturers:
-            return f"{filename}: not a Zwift file (manufacturer {man})"
+            return None, f"{filename}: not a Zwift file (manufacturer {man})"
         track = extract_track(fit)
         if not track:
-            return f"{filename}: no GPS points"
+            return None, f"{filename}: no GPS points"
         start = datetime.fromtimestamp(ff.unix_from_fit(track[0].ts), timezone.utc)
         end = datetime.fromtimestamp(ff.unix_from_fit(track[-1].ts), timezone.utc)
         source = Summary(0, filename, start, (end - start).total_seconds(), True, "", "zwift")
 
+        if garmin_activities is None:
+            garmin_activities = self.garmin.activities_between(
+                start.date() - timedelta(days=1), end.date() + timedelta(days=1))
         handled = self.store.handled_ids()
         candidates = []
-        for a in self.garmin.activities_between(start.date() - timedelta(days=1),
-                                                end.date() + timedelta(days=1)):
+        for a in garmin_activities:
             s = parse_summary(a)
             if not s or s.has_polyline or s.id in handled:
                 continue
@@ -80,21 +94,77 @@ class Service:
             if ratio >= self.cfg.min_overlap:
                 candidates.append((ratio, s))
         if not candidates:
-            return (f"{filename}: no watch activity without a map matches "
-                    f"({start:%Y-%m-%d %H:%M} UTC)")
+            return None, (f"{filename}: no watch activity without a map matches "
+                          f"({start:%Y-%m-%d %H:%M} UTC)")
         ratio, target = max(candidates, key=lambda c: c[0])
+        if keep_existing and self.store.get(target.id):
+            return target.id, f"{filename}: “{target.name}” is already in the list"
 
         folder = self.cfg.backup_dir / str(target.id)
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / "zwift_uploaded.fit"
         path.write_bytes(data)
-        if not self.store.upsert_detected(target.id, 0, target.name, f"File {filename}",
+        if not self.store.upsert_detected(target.id, 0, target.name, label,
                                           target.start.isoformat(), ratio, source_file=str(path)):
-            return f"{filename}: activity “{target.name}” is already handled"
-        return f"{filename} → “{target.name}” ({target.start:%Y-%m-%d %H:%M} UTC)"
+            return target.id, f"{filename}: activity “{target.name}” is already handled"
+        return target.id, f"{filename} → “{target.name}” ({target.start:%Y-%m-%d %H:%M} UTC)"
+
+    # --- Zwift history ------------------------------------------------------
+
+    def sync_zwift(self, zwift, since: datetime, progress=None) -> dict[str, int]:
+        """Download Zwift FIT files since ``since`` and pair them with watch activities.
+
+        Activities already looked at are skipped, so running it again only
+        fetches new ones. ``progress(counts, message)`` is called after each one.
+        """
+        counts = {"seen": 0, "downloaded": 0, "paired": 0, "skipped": 0, "errors": 0}
+        garmin_acts = self.garmin.activities_between(since.date() - timedelta(days=1),
+                                                     datetime.now(timezone.utc).date() + timedelta(days=1))
+        handled = self.store.handled_ids()
+        # Only Zwift activities that overlap a watch activity without a map are downloaded.
+        watch = [s for s in (parse_summary(a) for a in garmin_acts)
+                 if s and not s.has_polyline and s.id not in handled]
+        for act in zwift.history(since):
+            counts["seen"] += 1
+            if self.store.zwift_seen(act.id):
+                counts["skipped"] += 1
+                continue
+            start_iso = act.start.isoformat() if act.start else None
+            near = act.start and any(
+                w.start <= act.start + timedelta(hours=1) and w.end >= act.start - timedelta(hours=1)
+                for w in watch)
+            if not near:
+                # Recent activities may still be on their way to Garmin: look again next time.
+                if act.start and act.start < datetime.now(timezone.utc) - timedelta(days=2):
+                    self.store.mark_zwift_seen(act.id, act.name, start_iso, None,
+                                               "no watch activity without a map at that time")
+                counts["skipped"] += 1
+                continue
+            try:
+                data = zwift.download_fit(act)
+                counts["downloaded"] += 1
+                target_id, msg = self._pair_source(
+                    f"{act.name or 'Zwift'} ({act.start:%Y-%m-%d})", data,
+                    label=f"Zwift: {act.name}", garmin_activities=garmin_acts, keep_existing=True)
+            except Exception as e:  # noqa: BLE001 - keep going, retried next sync
+                log.warning("Zwift activity %s failed: %s", act.id, e)
+                counts["errors"] += 1
+                if progress:
+                    progress(counts, f"{act.name}: {e}")
+                continue
+            if target_id:
+                counts["paired"] += 1
+            self.store.mark_zwift_seen(act.id, act.name, start_iso, target_id, msg)
+            if progress:
+                progress(counts, msg)
+        return counts
 
     def scan_and_maybe_merge(self) -> None:
         self.scan()
+        self.merge_pending()
+
+    def merge_pending(self) -> None:
+        """In automatic mode, merge every pair waiting for a click."""
         if not self.cfg.auto_merge:
             return
         for row in self.store.all():
