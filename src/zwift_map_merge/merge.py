@@ -17,6 +17,7 @@ from .fitfile import FieldDef, FitFile, Message
 F_LAT, F_LON, F_ALT, F_ENH_ALT = 0, 1, 2, 78
 F_START_TIME, F_START_LAT, F_START_LON, F_END_LAT, F_END_LON = 2, 3, 4, 5, 6
 F_MANUFACTURER = 1
+F_TIME_CREATED = 4
 
 
 @dataclass
@@ -199,6 +200,15 @@ def merge_track(target_bytes: bytes, source_bytes: bytes, *, tolerance_s: int = 
                 if p:
                     _set(msg, F_END_LAT, p.lat)
                     _set(msg, F_END_LON, p.lon)
+
+    # Garmin refuses a file whose file_id (device + time created) it has seen before,
+    # even right after the activity was deleted. One second later on time_created
+    # makes the merged file new to Garmin; the device identity is unchanged.
+    for msg in target.messages(ff.MESG_FILE_ID):
+        created = msg.get(F_TIME_CREATED)
+        if created is not None:
+            _set(msg, F_TIME_CREATED, created + 1)
+        break
 
     return ff.encode(target), stats
 

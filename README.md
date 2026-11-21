@@ -11,11 +11,11 @@ During a Zwift run, the footpod is paired with the watch: the watch activity has
 For each pair of *watch activity without a map* + *Zwift activity with a map* that overlap in time:
 
 1. It downloads both original FIT files and backs them up in `data/backups/<id>/`.
-2. It adds the Zwift GPS position (and, optionally, altitude) to the watch FIT, point by point, by timestamp. Everything else in the watch file is kept byte for byte: proprietary messages, developer fields, device info. The activity still counts as a watch activity.
+2. It adds the Zwift GPS position (and, optionally, altitude) to the watch FIT, point by point, by timestamp. Everything else in the watch file is kept byte for byte: proprietary messages, developer fields, device info. The only other change is the file creation time, one second later, because Garmin refuses a file it has already seen, even after the activity was deleted. The device identity is untouched, so the activity still counts as a watch activity.
 3. It reads the merged file back to validate it (CRC, sizes, GPS points present).
-4. **Only when you ask** (or in automatic mode), it deletes the Zwift copy and the original watch activity on Garmin, imports the merged file, then restores the name, description, type and gear.
+4. **Only when you ask** (or in automatic mode, or with **Merge all**), it imports the merged file first, and deletes the original watch activity and the Zwift copy only once the merged activity is on Garmin. Then it restores the name, description, type and gear.
 
-If the import fails, the original watch FIT is re-imported. The backups are always kept.
+Every step is checked against the Garmin activity list, since Garmin sometimes answers with an error (such as a 504) for a request that went through. If Garmin only takes the merged file once the original is gone, the original is deleted first and re-imported if the merged import still fails. If an earlier attempt left the watch activity deleted without a replacement, clicking **Merge** again imports it from the backups. The backups are always kept.
 
 Strava is never touched. Garmin does not share imported activities with Strava.
 

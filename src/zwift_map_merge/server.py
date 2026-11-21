@@ -30,6 +30,7 @@ STATUS_LABELS = {
     "merged": "Merged",
     "failed": "Failed",
     "ignored": "Ignored",
+    "queued": "Queued",
 }
 
 CSS = """
@@ -155,7 +156,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # The action URLs only accept POST. A reload or a bookmark sends a GET:
     # go back to the page instead of answering "Method Not Allowed".
     for path in ("/login", "/mfa", "/logout", "/scan", "/upload",
-                 "/zwift/login", "/zwift/logout", "/zwift/sync"):
+                 "/zwift/login", "/zwift/logout", "/zwift/sync", "/merge-all"):
         app.add_api_route(path, lambda: RedirectResponse("/", status_code=303),
                           methods=["GET"], include_in_schema=False)
 
@@ -193,7 +194,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "<input name='email' type='email' placeholder='Email' required>"
                 "<input name='password' type='password' placeholder='Password' required>"
                 "<button class='primary'>Log in</button></form></div>")
-        busy = state["zwift"]["running"] or any(r["status"] == "running" for r in store.all())
+        busy = state["zwift"]["running"] or any(r["status"] in ("running", "queued") for r in store.all())
         return _page(_dashboard(cfg, store, state, zwift.connected()),
                      head="<meta http-equiv='refresh' content='5'>" if busy else "")
 
@@ -271,6 +272,15 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(400, "invalid date")
         if zwift.connected() and garmin.has_tokens():
             threading.Thread(target=zwift_sync, args=(start,), daemon=True).start()
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/merge-all", dependencies=[Depends(check_auth)])
+    def merge_all() -> RedirectResponse:
+        waiting = [r["target_id"] for r in store.all() if r["status"] in ("detected", "simulated")]
+        for tid in waiting:
+            store.set_status(tid, "queued", "Waiting for its turn")
+        if waiting:
+            threading.Thread(target=service.merge_all, daemon=True).start()
         return RedirectResponse("/", status_code=303)
 
     @app.post("/pairs/{target_id}/{action}", dependencies=[Depends(check_auth)])
@@ -440,6 +450,7 @@ def _zwift_card(cfg: Config, state: dict, connected: bool) -> str:
 
 def _dashboard(cfg: Config, store: Store, state: dict, zwift_connected: bool = False) -> str:
     rows = store.all()
+    waiting = sum(1 for r in rows if r["status"] in ("detected", "simulated"))
     mode = ("<b>automatic</b>: every detected pair is merged" if cfg.auto_merge
             else "<b>manual</b>: nothing changes until you click “Merge”")
     err = f"<p class='st-failed'>Last error: {html.escape(state['last_error'])}</p>" if state["last_error"] else ""
@@ -447,6 +458,9 @@ def _dashboard(cfg: Config, store: Store, state: dict, zwift_connected: bool = F
         "<div class='card'><div class='row' style='justify-content:space-between'>"
         f"<div>Mode {mode}. Scans every {cfg.scan_interval_minutes} min over the last {cfg.scan_days} days.</div>"
         "<div class='row'><form class='inline' method='post' action='/scan'><button>Scan now</button></form>"
+        + (f"<form class='inline' method='post' action='/merge-all' onsubmit=\"return confirm('Merge all {waiting} pairs on Garmin?')\">"
+           f"<button class='primary'>Merge all ({waiting})</button></form>" if waiting else "")
+        + 
         "<form class='inline' method='post' action='/logout'><button>Disconnect Garmin</button></form></div>"
         f"</div>{err}</div>"
     )

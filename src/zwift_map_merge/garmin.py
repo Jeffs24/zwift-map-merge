@@ -19,6 +19,10 @@ class GarminAuthRequired(RuntimeError):
     pass
 
 
+class DuplicateActivity(RuntimeError):
+    """Garmin refused the file because it already has an activity from it."""
+
+
 class GarminSession:
     """Holds one logged-in client; tokens live in ``token_dir``."""
 
@@ -108,31 +112,75 @@ class GarminSession:
             return []
         return [g["uuid"] for g in gear if isinstance(g, dict) and g.get("uuid")]
 
-    def delete(self, activity_id: int) -> None:
-        self.client().delete_activity(str(activity_id))
+    def _around(self, start: datetime) -> list[dict[str, Any]]:
+        return self.activities_between(start.date() - timedelta(days=1), start.date() + timedelta(days=1))
+
+    def exists(self, activity_id: int, start: datetime) -> bool:
+        """Whether the activity is still on Garmin, checked in the activity list.
+
+        Used after an error: Garmin sometimes answers 5xx or times out even
+        though the request went through.
+        """
+        return any(int(a.get("activityId", 0)) == int(activity_id) for a in self._around(start))
+
+    def find_new(self, start: datetime, exclude: set[int]) -> int | None:
+        """Id of an activity starting within 60 s of ``start`` that is not in ``exclude``."""
+        for a in self._around(start):
+            aid = int(a.get("activityId", 0))
+            if aid in exclude:
+                continue
+            try:
+                a_start = datetime.strptime(a["startTimeGMT"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except (KeyError, ValueError):
+                continue
+            if abs((a_start - start).total_seconds()) <= 60:
+                return aid
+        return None
+
+    def delete(self, activity_id: int, start: datetime, checks: int = 6, pause_s: float = 10) -> None:
+        """Delete and make sure the activity is gone, whatever Garmin answered."""
+        try:
+            self.client().delete_activity(str(activity_id))
+        except Exception as e:  # noqa: BLE001 - verified below
+            log.warning("Delete of %s answered %s; checking whether it went through", activity_id, e)
+        for i in range(checks):
+            if not self.exists(activity_id, start):
+                return
+            if i < checks - 1:
+                time.sleep(pause_s)
+        raise RuntimeError(f"activity {activity_id} is still on Garmin after deleting it")
 
     def import_fit(self, path: Path, start: datetime, exclude: set[int],
-                   wait_s: int = 180) -> int:
-        """Import ``path`` and return the id of the new activity."""
-        result = self.client().import_activity(str(path))
-        detailed = (result or {}).get("detailedImportResult") or {}
-        for s in detailed.get("successes") or []:
-            if s.get("internalId"):
-                return int(s["internalId"])
+                   wait_s: int = 300, pause_s: float = 10) -> int:
+        """Import ``path`` and return the id of the new activity.
+
+        Raises DuplicateActivity when Garmin says it already has this file.
+        After any other error, still looks for the activity: Garmin may have
+        taken the file despite a 5xx or a timeout.
+        """
+        error: Exception | None = None
+        try:
+            result = self.client().import_activity(str(path))
+            detailed = (result or {}).get("detailedImportResult") or {}
+            for s in detailed.get("successes") or []:
+                if s.get("internalId"):
+                    return int(s["internalId"])
+        except Exception as e:  # noqa: BLE001
+            if "duplicate" in str(e).lower():
+                raise DuplicateActivity(str(e)) from e
+            log.warning("Import of %s answered %s; looking for the activity anyway", path.name, e)
+            error = e
         # Processing is asynchronous: look for the activity by start time.
         deadline = time.monotonic() + wait_s
-        while time.monotonic() < deadline:
-            time.sleep(10)
-            for a in self.activities(days=max(1, (date.today() - start.date()).days + 1)):
-                aid = int(a["activityId"])
-                if aid in exclude:
-                    continue
-                try:
-                    a_start = datetime.strptime(a["startTimeGMT"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                except (KeyError, ValueError):
-                    continue
-                if abs((a_start - start).total_seconds()) <= 60:
-                    return aid
+        while True:
+            found = self.find_new(start, exclude)
+            if found:
+                return found
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(pause_s)
+        if error:
+            raise RuntimeError(f"import failed ({error}) and no new activity appeared")
         raise TimeoutError("imported activity not found after import")
 
     def restore(self, activity_id: int, *, name: str | None, description: str | None,

@@ -87,3 +87,20 @@ def test_login_error_is_shown(tmp_path):
                 break
             threading.Event().wait(0.05)
         assert "Login refused: 401 Unauthorized" in page
+
+
+def test_merge_all_button_queues_waiting_pairs(tmp_path):
+    with client(tmp_path) as c:
+        (tmp_path / "garminconnect").mkdir()
+        (tmp_path / "garminconnect" / "garmin_tokens.json").write_text("{}")
+        svc = c.app.state.service
+        store = svc.store
+        store.upsert_detected(1, 2, "Run A", "Zwift A", "2026-11-20T12:00:00+00:00", 0.97)
+        store.upsert_detected(3, 4, "Run B", "Zwift B", "2026-11-19T12:00:00+00:00", 0.97)
+        assert "Merge all (2)" in c.get("/").text
+        merged = []
+        svc.merge_all = lambda: merged.append(True)
+        r = c.post("/merge-all", follow_redirects=False)
+        assert r.status_code == 303
+        assert {row["status"] for row in store.all()} == {"queued"}
+        assert "refresh" in c.get("/").text  # page refreshes while queued

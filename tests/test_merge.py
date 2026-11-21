@@ -84,3 +84,13 @@ def test_compressed_timestamp_records():
 def test_source_without_gps_is_refused():
     with pytest.raises(MergeError):
         merge_track(watch_fit(START, 10), watch_fit(START, 10))
+
+
+def test_merged_file_gets_a_new_time_created_but_same_device():
+    watch = watch_fit(START, 10)
+    merged, _ = merge_track(watch, zwift_fit(START, 10))
+    before = next(ff.parse(watch).messages(ff.MESG_FILE_ID))
+    after = next(ff.parse(merged).messages(ff.MESG_FILE_ID))
+    assert after.get(4) == before.get(4) + 1  # time_created
+    assert after.get(1) == before.get(1)  # manufacturer
+    assert after.get(0) == before.get(0)  # file type

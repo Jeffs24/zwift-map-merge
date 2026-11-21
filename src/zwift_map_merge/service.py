@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import logging
 import threading
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from . import fitfile as ff
 from .config import Config
-from .garmin import GarminSession
+from .garmin import DuplicateActivity, GarminSession
 from .merge import MergeError, extract_track, manufacturer, merge_track
 from .pairing import Summary, find_pairs, overlap_ratio, parse_summary
 from .store import Store
@@ -255,61 +256,148 @@ class Service:
                                   position_ratio=prep.ratio)
             return prep
 
+    def _from_backup(self, target_id: int) -> Prepared | None:
+        """Files of an earlier attempt, for when the watch activity is no longer on Garmin."""
+        row = self.store.get(target_id)
+        folder = self.cfg.backup_dir / str(target_id)
+        watch = folder / f"{target_id}_watch.fit"
+        source = Path(row["source_file"]) if row and row["source_file"] else \
+            folder / f"{row['source_id'] if row else 0}_zwift.fit"
+        if not (row and watch.exists() and source.exists()):
+            return None
+        # Rebuild the merged file: one written by an older version may carry the
+        # original file_id, which Garmin refuses as already uploaded.
+        merged_bytes, stats = merge_track(watch.read_bytes(), source.read_bytes(),
+                                          tolerance_s=self.cfg.time_tolerance_s,
+                                          copy_altitude=self.cfg.copy_altitude)
+        merged = folder / f"{target_id}_merged.fit"
+        merged.write_bytes(merged_bytes)
+        return Prepared(target_id, row["source_id"], merged, watch, stats.ratio,
+                        datetime.fromisoformat(row["start_utc"]))
+
+    def _metadata(self, target_id: int, folder: Path, fallback_name: str | None) -> dict:
+        """Name, description, type and gear of the watch activity, saved next to the backups."""
+        path = folder / "metadata.json"
+        try:
+            detail = self.garmin.activity(target_id)
+            meta = {"name": detail.get("activityName"), "description": detail.get("description"),
+                    "type_dto": detail.get("activityTypeDTO"), "gear": self.garmin.gear_uuids(target_id)}
+            path.write_text(json.dumps(meta))
+            return meta
+        except Exception as e:  # noqa: BLE001 - activity may already be gone
+            log.warning("Could not read metadata of %s: %s", target_id, e)
+        if path.exists():
+            return json.loads(path.read_text())
+        return {"name": fallback_name, "description": None, "type_dto": None, "gear": []}
+
     def merge(self, target_id: int) -> int | None:
+        """Replace the watch activity with the merged one, without ever losing it.
+
+        The merged file is imported first; the original watch activity and the
+        Zwift copy are deleted only once the merged activity exists. If Garmin
+        refuses the import as a duplicate of the original, the original is
+        deleted first and re-imported if the merged import still fails.
+        Every Garmin answer is checked against the activity list, because
+        Garmin sometimes reports an error (504) for a request that went through.
+        """
         with self._lock:
             row = self.store.get(target_id)
-            if row and row["status"] == "merged":
+            if not row:
+                return None
+            if row["status"] == "merged":
                 return row["new_id"]
             try:
                 prep = self._prepare(target_id)
-            except Exception as e:
-                log.exception("Could not prepare %s", target_id)
-                self.store.set_status(target_id, "failed", f"Preparation: {e}")
-                return None
-
-            detail = self.garmin.activity(target_id)
-            name = detail.get("activityName")
-            description = detail.get("description")
-            type_dto = detail.get("activityTypeDTO")
-            gear = self.garmin.gear_uuids(target_id)
-
-            # From here on Garmin is modified. Both original FIT files are on disk.
-            try:
-                if self.cfg.delete_source and prep.source_id:
-                    self.garmin.delete(prep.source_id)
-                self.garmin.delete(target_id)
+                target_on_garmin = True
             except Exception as e:  # noqa: BLE001
-                log.exception("Delete failed for %s", target_id)
-                self.store.set_status(target_id, "failed",
-                                      f"Delete on Garmin failed: {e}. Nothing was imported; "
-                                      f"backups in {prep.target_backup.parent}")
-                return None
-            exclude = {target_id, prep.source_id}
-            try:
-                new_id = self.garmin.import_fit(prep.merged_path, prep.start, exclude)
-            except Exception as e:  # noqa: BLE001
-                log.exception("Import of the merged file failed for %s", target_id)
-                msg = f"Import of the merged file failed: {e}. "
+                prep = None
                 try:
-                    restored = self.garmin.import_fit(prep.target_backup, prep.start, exclude)
-                    self.garmin.restore(restored, name=name, description=description,
-                                        type_dto=type_dto, gear=gear)
-                    msg += f"The original watch activity was re-imported (id {restored})."
-                except Exception as e2:  # noqa: BLE001
-                    msg += (f"Re-importing the original also failed ({e2}). "
-                            f"Backup files: {prep.target_backup.parent}")
-                self.store.set_status(target_id, "failed", msg)
-                return None
+                    if not self.garmin.exists(target_id, datetime.fromisoformat(row["start_utc"])):
+                        prep = self._from_backup(target_id)
+                except Exception:  # noqa: BLE001
+                    log.exception("Recovery from backups failed for %s", target_id)
+                if prep is None:
+                    log.exception("Could not prepare %s", target_id)
+                    self.store.set_status(target_id, "failed", f"Preparation: {e}")
+                    return None
+                # Recovery: an earlier attempt deleted the watch activity but did not import.
+                log.info("Activity %s is no longer on Garmin: importing the saved merged file", target_id)
+                target_on_garmin = False
 
-            failed = self.garmin.restore(new_id, name=name, description=description,
-                                         type_dto=type_dto, gear=gear)
+            folder = prep.target_backup.parent
+            meta = self._metadata(target_id, folder, row["target_name"])
+            exclude = {target_id, prep.source_id}
+            steps: list[str] = []
+
+            def fail(message: str) -> None:
+                self.store.set_status(target_id, "failed",
+                                      message + f" Backups: {folder}. Click Merge again to retry.")
+
+            new_id = None
+            if target_on_garmin:
+                try:
+                    new_id = self.garmin.import_fit(prep.merged_path, prep.start, exclude)
+                except DuplicateActivity:
+                    steps.append("Garmin saw the merged file as a duplicate of the original")
+                except Exception as e:  # noqa: BLE001
+                    log.exception("Import of the merged file failed for %s", target_id)
+                    fail(f"Import of the merged file failed: {e}. Nothing was deleted.")
+                    return None
+                if new_id is None:
+                    # Garmin needs the original gone before it takes the merged file.
+                    try:
+                        self.garmin.delete(target_id, prep.start)
+                    except Exception as e:  # noqa: BLE001
+                        fail(f"{steps[0]}, and deleting the original failed: {e}. Nothing changed.")
+                        return None
+                    target_on_garmin = False
+
+            if new_id is None:
+                try:
+                    new_id = self.garmin.import_fit(prep.merged_path, prep.start, exclude)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("Import of the merged file failed for %s", target_id)
+                    msg = f"Import of the merged file failed: {e}. "
+                    try:
+                        restored = self.garmin.import_fit(prep.target_backup, prep.start, exclude)
+                        self.garmin.restore(restored, **meta)
+                        msg += f"The original watch activity was re-imported (id {restored})."
+                    except Exception as e2:  # noqa: BLE001
+                        msg += f"Re-importing the original also failed ({e2})."
+                    fail(msg)
+                    return None
+
+            # The merged activity exists: now remove what it replaces.
+            leftovers = []
+            to_delete = [target_id] if target_on_garmin else []
+            if self.cfg.delete_source and prep.source_id:
+                to_delete.append(prep.source_id)
+            for aid in to_delete:
+                try:
+                    self.garmin.delete(aid, prep.start)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Could not delete %s: %s", aid, e)
+                    leftovers.append(str(aid))
+
+            failed = self.garmin.restore(new_id, **meta)
             msg = f"Merged ({prep.ratio:.0%} of points with a position)."
             if failed:
                 msg += " Redo by hand: " + ", ".join(failed) + "."
+            if leftovers:
+                msg += " Delete by hand on Garmin: activity " + ", ".join(leftovers) + "."
             self.store.set_status(target_id, "merged", msg, new_id=new_id,
                                   position_ratio=prep.ratio)
             log.info("Merged %s + %s -> %s", target_id, prep.source_id, new_id)
             return new_id
+
+    def merge_all(self) -> int:
+        """Merge every pair waiting in the list, one after the other."""
+        done = 0
+        for row in self.store.all():
+            if row["status"] in ("detected", "simulated", "queued"):
+                if self.merge(row["target_id"]):
+                    done += 1
+        return done
 
     def ignore(self, target_id: int) -> None:
         self.store.set_status(target_id, "ignored", "Ignored by hand")
